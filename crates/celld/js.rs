@@ -9352,7 +9352,7 @@ fn op_http_stream_read(
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let service = http_stream_service();
     let read = http_stream_read(service, stream_id);
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         match read.await? {
             Some(bytes) => Ok(asyncrt::OpOut::Bytes(bytes)),
             None => Ok(asyncrt::OpOut::Str(HTTP_STREAM_DONE.into())),
@@ -9447,7 +9447,16 @@ fn op_response_stream_write(
     // direction this gate exists to fail in.
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Response);
     let service = http_stream_service();
-    let id = asyncrt::enqueue(async move {
+    // A streaming body outlives its reply. These four ops (write, close
+    // watch, close, and `__http_stream_read`) are the pump's whole engine:
+    // with a handler lifetime the driver drops every pending one at the
+    // first wake after the reply is sent, which froze the pump mid-stream
+    // and left the client's response open with no EOF and no error (the
+    // 32-way SSE burst on a small node, urun hub CI 2026-10). IoContext
+    // lifetime keeps the op with the event's context until the stream
+    // actually settles, which is also what keeps the event driven while
+    // the body is still open.
+    let id = asyncrt::enqueue_io_context(async move {
         await_egress_gate(gate).await?;
         response_stream_write(service, stream_id, bytes).await?;
         Ok(String::new())
@@ -9465,7 +9474,7 @@ fn op_response_stream_closed(
         .writer_close_watch(stream_id)
         .map(|(writer, finished)| (Some(writer), Some(finished)))
         .unwrap_or((None, None));
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         let cancelled = match (writer, finished.as_mut()) {
             (Some(writer), Some(finished)) => crate::asyncrt::select_biased! {
                 "stream completion wins a tie so a completed response is not reported as cancelled";
@@ -9491,7 +9500,7 @@ fn op_response_stream_close(
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let error = args.get(1).to_rust_string_lossy(scope);
     let close = response_stream_close(http_stream_service(), stream_id, error);
-    let id = asyncrt::enqueue(async move {
+    let id = asyncrt::enqueue_io_context(async move {
         close.await?;
         Ok(String::new())
     });
